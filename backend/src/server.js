@@ -2,6 +2,7 @@ import dotenv from 'dotenv'
 import crypto from 'node:crypto'
 import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
@@ -25,8 +26,12 @@ loadEnvFiles()
 
 const app = express()
 const port = process.env.PORT || 4000
-const storageRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'storage')
-const dataRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data')
+const isVercel = Boolean(process.env.VERCEL)
+const localStorageRoot = path.join(currentDir, '..', 'storage')
+const localDataRoot = path.join(currentDir, '..', 'data')
+const bundledStateFile = path.join(localDataRoot, 'state.json')
+const storageRoot = isVercel ? path.join(os.tmpdir(), 'securelog', 'storage') : localStorageRoot
+const dataRoot = isVercel ? path.join(os.tmpdir(), 'securelog', 'data') : localDataRoot
 const stateFile = path.join(dataRoot, 'state.json')
 const users = new Map()
 const challenges = new Map()
@@ -296,8 +301,15 @@ function buildModificationDetails(previousBuffer, modifiedBuffer) {
   return output.length > 4000 ? `${output.slice(0, 4000)}\n... (truncated; see attached file)` : output
 }
 
+function publicFrontendBaseUrl() {
+  if (process.env.FRONTEND_URL?.trim()) return process.env.FRONTEND_URL.trim().replace(/\/+$/, '')
+  const vercelHost = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL
+  if (vercelHost) return `https://${vercelHost.replace(/^https?:\/\//, '')}`
+  return 'http://127.0.0.1:5173'
+}
+
 async function sendSecurityAlertEmail({ recipientEmail, recipientName, record, alert, subject, summary, reason, modificationDetails = '', attachments = [] }) {
-  const dashboardUrl = `${process.env.FRONTEND_URL || 'http://127.0.0.1:5173'}/dashboard`
+  const dashboardUrl = `${publicFrontendBaseUrl()}/dashboard`
   const text = [
     `Hello ${recipientName || 'User'},`,
     '',
@@ -448,6 +460,13 @@ async function loadState() {
       state = JSON.parse(await fs.readFile(stateFile, 'utf8'))
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
+      if (isVercel && stateFile !== bundledStateFile) {
+        try {
+          state = JSON.parse(await fs.readFile(bundledStateFile, 'utf8'))
+        } catch (bundledError) {
+          if (bundledError.code !== 'ENOENT') throw bundledError
+        }
+      }
     }
   }
   if (!state) return
@@ -456,8 +475,16 @@ async function loadState() {
   for (const alert of state.alerts || []) alerts.set(alert.logId, alert)
 }
 
+const allowedOrigins = [
+  process.env.CORS_ORIGIN || 'http://localhost:5173',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  ...(process.env.VERCEL_PROJECT_PRODUCTION_URL ? [`https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`] : []),
+  ...(process.env.VERCEL_URL ? [`https://${process.env.VERCEL_URL}`] : []),
+]
+
 app.use(helmet())
-app.use(cors({ origin: [process.env.CORS_ORIGIN || 'http://localhost:5173', 'http://localhost:5173', 'http://127.0.0.1:5173'], credentials: true }))
+app.use(cors({ origin: allowedOrigins, credentials: true }))
 app.use(express.json({ limit: '12mb' }))
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'securelog-api', mode: 'prototype', metadataStore: process.env.MONGODB_URI ? 'mongodb' : 'local-file' }))
 
@@ -732,5 +759,9 @@ function startStorageWatcher() {
 await fs.mkdir(storageRoot, { recursive: true })
 await loadState()
 await ensureSuperAdminAccount()
-startStorageWatcher()
-app.listen(port, '127.0.0.1', () => console.log(`SecureLog API listening on http://127.0.0.1:${port}`))
+if (!isVercel) {
+  startStorageWatcher()
+  app.listen(port, '127.0.0.1', () => console.log(`SecureLog API listening on http://127.0.0.1:${port}`))
+}
+
+export default app

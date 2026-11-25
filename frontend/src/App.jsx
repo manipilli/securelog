@@ -12,12 +12,14 @@ function requestErrorMessage(error) {
 async function readJsonResponse(response) {
   const raw = await response.text()
   if (!raw) {
-    throw new Error('Cannot reach the SecureLog backend API on port 4000 (empty response). Start both frontend and backend with "npm run dev" from the project root.')
+    throw new Error(import.meta.env.DEV
+      ? 'Cannot reach the SecureLog backend API on port 4000 (empty response). Start both frontend and backend with "npm run dev" from the project root.'
+      : `Empty response from SecureLog API (HTTP ${response.status}).`)
   }
   try {
     return JSON.parse(raw)
   } catch {
-    throw new Error(`Unexpected response from SecureLog API (HTTP ${response.status}). Make sure the backend server is running with "npm run dev".`)
+    throw new Error(`Unexpected response from SecureLog API (HTTP ${response.status}).`)
   }
 }
 
