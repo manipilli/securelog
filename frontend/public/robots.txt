@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://securelog.example/sitemap.xml

@@ -1,0 +1,21 @@
+{
+  "name": "securelog-backend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "bcrypt": "latest",
+    "cors": "latest",
+    "dotenv": "latest",
+    "express": "latest",
+    "helmet": "latest",
+    "mongoose": "latest",
+    "multer": "latest",
+    "nodemailer": "^10.6.1",
+    "zod": "latest"
+  }
+}

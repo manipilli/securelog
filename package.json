@@ -1,0 +1,20 @@
+{
+  "name": "securelog",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend",
+    "backend",
+    "blockchain"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "build": "npm run build --workspace frontend",
+    "server": "npm run dev --workspace backend",
+    "start": "npm run start --workspace backend"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.2"
+  }
+}
