@@ -75,13 +75,28 @@ function verifySignedPayload(token) {
 }
 
 function tokenFor(user) {
-  return signPayload({ userId: user.id, exp: Date.now() + 8 * 60 * 60 * 1000 })
+  return signPayload({
+    userId: user.id,
+    organizationId: user.organizationId,
+    name: user.name,
+    email: user.email,
+    phone: user.phone || '',
+    role: user.role || 'user',
+    exp: Date.now() + 8 * 60 * 60 * 1000,
+  })
 }
 
 function userFromToken(token) {
   const data = verifySignedPayload(token)
   if (!data || data.exp <= Date.now()) return null
-  return users.get(data.userId) || null
+  return users.get(data.userId) || (data.email ? {
+    id: data.userId,
+    organizationId: data.organizationId,
+    name: data.name,
+    email: data.email,
+    phone: data.phone || '',
+    role: data.role || 'user',
+  } : null)
 }
 
 async function requireAuth(req, res, next) {
@@ -549,8 +564,17 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   await syncStateIfMongo()
-  const user = [...users.values()].find(candidate => candidate.email === String(req.body.email || '').toLowerCase().trim())
-  if (!user || !(await bcrypt.compare(req.body.password || '', user.passwordHash))) return res.status(401).json({ error: 'Email or password is incorrect.' })
+  const email = String(req.body.email || '').toLowerCase().trim()
+  const user = [...users.values()].find(candidate => candidate.email === email)
+  if (!user) {
+    if (isVercel && !process.env.MONGODB_URI) {
+      return res.status(401).json({ error: 'Account not found on this serverless instance because MONGODB_URI is not configured in Vercel. Add MONGODB_URI for persistent login, or register again.' })
+    }
+    return res.status(401).json({ error: 'Email or password is incorrect.' })
+  }
+  if (!(await bcrypt.compare(req.body.password || '', user.passwordHash))) {
+    return res.status(401).json({ error: 'Email or password is incorrect.' })
+  }
   const challengePayload = await issueChallenge(user, 'email', { purpose: 'login' })
   res.json({ user: publicUser(user), purpose: 'login', ...challengePayload })
 })
