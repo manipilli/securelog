@@ -35,6 +35,7 @@ const dataRoot = isVercel ? path.join(os.tmpdir(), 'securelog', 'data') : localD
 const stateFile = path.join(dataRoot, 'state.json')
 const users = new Map()
 const challenges = new Map()
+const usedChallenges = new Set()
 const logs = new Map()
 const alerts = new Map()
 const internalWrites = new Set()
@@ -50,28 +51,46 @@ const verifyUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 })
 
-function tokenFor(user) {
-  const payload = Buffer.from(JSON.stringify({ userId: user.id, exp: Date.now() + 8 * 60 * 60 * 1000 })).toString('base64url')
-  const signature = crypto.createHmac('sha256', process.env.JWT_SECRET || 'development-only-jwt-secret').update(payload).digest('base64url')
+function hmacSecret() {
+  return process.env.JWT_SECRET || 'development-only-jwt-secret'
+}
+
+function signPayload(data) {
+  const payload = Buffer.from(JSON.stringify(data)).toString('base64url')
+  const signature = crypto.createHmac('sha256', hmacSecret()).update(payload).digest('base64url')
   return `${payload}.${signature}`
 }
 
-function userFromToken(token) {
-  if (!token) return null
+function verifySignedPayload(token) {
+  if (!token || typeof token !== 'string') return null
   const [payload, signature] = token.split('.')
   if (!payload || !signature) return null
-  const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || 'development-only-jwt-secret').update(payload).digest('base64url')
+  const expected = crypto.createHmac('sha256', hmacSecret()).update(payload).digest('base64url')
   if (signature.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null
   try {
-    const data = JSON.parse(Buffer.from(payload, 'base64url').toString())
-    return data.exp > Date.now() ? users.get(data.userId) : null
+    return JSON.parse(Buffer.from(payload, 'base64url').toString())
   } catch {
     return null
   }
 }
 
-function requireAuth(req, res, next) {
-  const user = userFromToken(req.headers.authorization?.replace(/^Bearer\s+/i, ''))
+function tokenFor(user) {
+  return signPayload({ userId: user.id, exp: Date.now() + 8 * 60 * 60 * 1000 })
+}
+
+function userFromToken(token) {
+  const data = verifySignedPayload(token)
+  if (!data || data.exp <= Date.now()) return null
+  return users.get(data.userId) || null
+}
+
+async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
+  let user = userFromToken(token)
+  if (!user && process.env.MONGODB_URI) {
+    await syncStateIfMongo()
+    user = userFromToken(token)
+  }
   if (!user) return res.status(401).json({ error: 'Sign in and complete verification first.' })
   req.user = user
   next()
@@ -193,25 +212,26 @@ async function sendMail({ to, subject, text, html, attachments, logLabel }) {
   }
 }
 
+function hashChallengeCode(challengeNonce, code) {
+  return crypto.createHmac('sha256', hmacSecret()).update(`${challengeNonce}:${String(code || '').trim()}`).digest('hex')
+}
+
 async function issueChallenge(user, _method = 'email', { purpose = 'login', pendingUser = null } = {}) {
   const code = String(crypto.randomInt(100000, 1000000))
-  const challengeId = crypto.randomUUID()
+  const challengeNonce = crypto.randomUUID()
   const effectiveMethod = 'email'
-  for (const [existingId, existingChallenge] of challenges.entries()) {
-    if (purpose === 'register' && existingChallenge.purpose === 'register' && existingChallenge.pendingUser?.email === user.email) {
-      challenges.delete(existingId)
-    } else if (purpose === 'login' && existingChallenge.purpose === 'login' && existingChallenge.userId === user.id) {
-      challenges.delete(existingId)
-    }
-  }
-  challenges.set(challengeId, {
+  const expiresAt = Date.now() + 10 * 60 * 1000
+  const codeHash = hashChallengeCode(challengeNonce, code)
+  const challengeId = signPayload({
+    id: challengeNonce,
     userId: user.id,
-    code,
     method: effectiveMethod,
     purpose,
     pendingUser,
-    expiresAt: Date.now() + 10 * 60 * 1000,
+    codeHash,
+    expiresAt,
   })
+  challenges.set(challengeNonce, { expiresAt })
   const destination = user.email
   let emailDelivery = null
   if (effectiveMethod === 'email') {
@@ -453,7 +473,9 @@ async function persistState() {
 async function loadState() {
   let state
   if (process.env.MONGODB_URI) {
-    await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
+    if (mongoose.connection.readyState === 0) {
+      await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
+    }
     state = await AppState.findById('securelog').lean()
   } else {
     try {
@@ -475,6 +497,12 @@ async function loadState() {
   for (const alert of state.alerts || []) alerts.set(alert.logId, alert)
 }
 
+async function syncStateIfMongo() {
+  if (process.env.MONGODB_URI) {
+    await loadState()
+  }
+}
+
 const allowedOrigins = [
   process.env.CORS_ORIGIN || 'http://localhost:5173',
   'http://localhost:5173',
@@ -489,6 +517,7 @@ app.use(express.json({ limit: '12mb' }))
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'securelog-api', mode: 'prototype', metadataStore: process.env.MONGODB_URI ? 'mongodb' : 'local-file' }))
 
 app.post('/api/auth/register', async (req, res) => {
+  await syncStateIfMongo()
   const { name, email, phone, password, role = 'user', adminInviteCode } = req.body
   const normalizedEmail = String(email || '').toLowerCase().trim()
   if (!name?.trim() || !normalizedEmail || !password || password.length < 12) {
@@ -519,6 +548,7 @@ app.post('/api/auth/register', async (req, res) => {
 })
 
 app.post('/api/auth/login', async (req, res) => {
+  await syncStateIfMongo()
   const user = [...users.values()].find(candidate => candidate.email === String(req.body.email || '').toLowerCase().trim())
   if (!user || !(await bcrypt.compare(req.body.password || '', user.passwordHash))) return res.status(401).json({ error: 'Email or password is incorrect.' })
   const challengePayload = await issueChallenge(user, 'email', { purpose: 'login' })
@@ -526,16 +556,17 @@ app.post('/api/auth/login', async (req, res) => {
 })
 
 app.post('/api/auth/resend-code', async (req, res) => {
-  const challenge = challenges.get(req.body.challengeId)
-  if (!challenge) {
+  await syncStateIfMongo()
+  const challenge = verifySignedPayload(req.body.challengeId)
+  if (!challenge || usedChallenges.has(challenge.id)) {
     return res.status(404).json({ error: 'Verification session expired or not found. Please start again.' })
   }
   const targetUser = challenge.pendingUser || users.get(challenge.userId)
   if (!targetUser) {
-    challenges.delete(req.body.challengeId)
     return res.status(404).json({ error: 'The account for this verification request no longer exists.' })
   }
-  challenges.delete(req.body.challengeId)
+  usedChallenges.add(challenge.id)
+  challenges.delete(challenge.id)
   const challengePayload = await issueChallenge(targetUser, challenge.method, {
     purpose: challenge.purpose || 'login',
     pendingUser: challenge.pendingUser || null,
@@ -544,14 +575,25 @@ app.post('/api/auth/resend-code', async (req, res) => {
 })
 
 app.post('/api/auth/verify-code', async (req, res) => {
-  const challenge = challenges.get(req.body.challengeId)
-  if (!challenge || challenge.expiresAt < Date.now() || challenge.code !== String(req.body.code || '').trim()) {
+  await syncStateIfMongo()
+  const challenge = verifySignedPayload(req.body.challengeId)
+  const submittedCodeHash = challenge?.id ? hashChallengeCode(challenge.id, req.body.code) : ''
+  const codeMatches = Boolean(
+    challenge
+    && !usedChallenges.has(challenge.id)
+    && challenge.expiresAt >= Date.now()
+    && typeof challenge.codeHash === 'string'
+    && submittedCodeHash.length === challenge.codeHash.length
+    && crypto.timingSafeEqual(Buffer.from(submittedCodeHash), Buffer.from(challenge.codeHash))
+  )
+  if (!codeMatches) {
     return res.status(401).json({ error: 'That verification code is invalid or expired.' })
   }
   let user
   if (challenge.pendingUser) {
     if ([...users.values()].some(existing => existing.email === challenge.pendingUser.email)) {
-      challenges.delete(req.body.challengeId)
+      usedChallenges.add(challenge.id)
+      challenges.delete(challenge.id)
       return res.status(409).json({ error: 'An account with this email already exists.' })
     }
     user = { ...challenge.pendingUser, emailVerified: true }
@@ -561,7 +603,8 @@ app.post('/api/auth/verify-code', async (req, res) => {
     user = users.get(challenge.userId)
     if (!user) return res.status(401).json({ error: 'The account for this verification request no longer exists.' })
   }
-  challenges.delete(req.body.challengeId)
+  usedChallenges.add(challenge.id)
+  challenges.delete(challenge.id)
   res.json({ token: tokenFor(user), user: publicUser(user) })
 })
 app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }))
