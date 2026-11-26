@@ -10,10 +10,11 @@ import cors from 'cors'
 import helmet from 'helmet'
 import multer from 'multer'
 import bcrypt from 'bcrypt'
-import mongoose from 'mongoose'
+import pg from 'pg'
 import nodemailer from 'nodemailer'
 import { gzipSync, gunzipSync } from 'node:zlib'
-import AppState from './models/AppState.js'
+
+const { Pool } = pg
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url))
 const rootEnvPath = path.join(currentDir, '..', '..', '.env')
@@ -102,8 +103,8 @@ function userFromToken(token) {
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
   let user = userFromToken(token)
-  if (!user && process.env.MONGODB_URI) {
-    await syncStateIfMongo()
+  if (!user && databaseUrl()) {
+    await syncStateIfDatabase()
     user = userFromToken(token)
   }
   if (!user) return res.status(401).json({ error: 'Sign in and complete verification first.' })
@@ -451,6 +452,57 @@ async function verifyRecordIntegrity(record, { candidateBuffer, previousBuffer, 
   return { logId: record.logId, result: 'TAMPERED', verifiedAt: now, alert, emailNotification: alert.emailNotification }
 }
 
+let pgPool = null
+let pgSchemaPromise = null
+
+function databaseUrl() {
+  return (
+    process.env.SUPABASE_DB_URL?.trim()
+    || process.env.POSTGRES_URL?.trim()
+    || process.env.DATABASE_URL?.trim()
+    || ''
+  )
+}
+
+async function getPgPool() {
+  const connectionString = databaseUrl()
+  if (!connectionString) return null
+  if (!pgPool) {
+    const isLocalHost = /@(127\.0\.0\.1|localhost)(:|\/)/i.test(connectionString)
+    pgPool = new Pool({
+      connectionString,
+      max: 3,
+      ssl: isLocalHost ? false : { rejectUnauthorized: false },
+    })
+  }
+  if (!pgSchemaPromise) {
+    pgSchemaPromise = (async () => {
+      await pgPool.query(`
+        CREATE TABLE IF NOT EXISTS securelog_state (
+          id TEXT PRIMARY KEY,
+          users JSONB NOT NULL DEFAULT '[]'::jsonb,
+          logs JSONB NOT NULL DEFAULT '[]'::jsonb,
+          alerts JSONB NOT NULL DEFAULT '[]'::jsonb,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `)
+      await pgPool.query(`
+        CREATE TABLE IF NOT EXISTS securelog_blobs (
+          log_id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          payload BYTEA NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `)
+    })().catch(error => {
+      pgSchemaPromise = null
+      throw error
+    })
+  }
+  await pgSchemaPromise
+  return pgPool
+}
+
 async function encryptToPrivateStorage(userId, logId, buffer) {
   const compressed = gzipSync(buffer, { level: 9 })
   const payload = compressed.length < buffer.length ? compressed : buffer
@@ -459,14 +511,34 @@ async function encryptToPrivateStorage(userId, logId, buffer) {
   const cipher = crypto.createCipheriv('aes-256-gcm', masterKey, iv)
   const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
   const tag = cipher.getAuthTag()
+  const encryptedBytes = Buffer.concat([iv, tag, ciphertext])
+  const pool = await getPgPool()
+  if (pool) {
+    await pool.query(
+      `INSERT INTO securelog_blobs (log_id, user_id, payload, updated_at)
+       VALUES ($1, $2, $3, NOW())
+       ON CONFLICT (log_id) DO UPDATE SET user_id = EXCLUDED.user_id, payload = EXCLUDED.payload, updated_at = NOW()`,
+      [logId, userId, encryptedBytes],
+    )
+  }
   markInternalWrite(userId, logId)
   await fs.mkdir(path.join(storageRoot, userId), { recursive: true })
-  await fs.writeFile(path.join(storageRoot, userId, `${logId}.bin`), Buffer.concat([iv, tag, ciphertext]))
-  return { compression, compressedSize: payload.length, encryptedSize: iv.length + tag.length + ciphertext.length }
+  await fs.writeFile(path.join(storageRoot, userId, `${logId}.bin`), encryptedBytes)
+  return { compression, compressedSize: payload.length, encryptedSize: encryptedBytes.length }
 }
 
 async function decryptFromPrivateStorage(record) {
-  const encrypted = await fs.readFile(path.join(storageRoot, record.userId, `${record.logId}.bin`))
+  let encrypted = null
+  const pool = await getPgPool()
+  if (pool) {
+    const result = await pool.query('SELECT payload FROM securelog_blobs WHERE log_id = $1', [record.logId])
+    if (result.rows[0]?.payload) {
+      encrypted = Buffer.from(result.rows[0].payload)
+    }
+  }
+  if (!encrypted) {
+    encrypted = await fs.readFile(path.join(storageRoot, record.userId, `${record.logId}.bin`))
+  }
   const decipher = crypto.createDecipheriv('aes-256-gcm', masterKey, encrypted.subarray(0, 12))
   decipher.setAuthTag(encrypted.subarray(12, 28))
   const payload = Buffer.concat([decipher.update(encrypted.subarray(28)), decipher.final()])
@@ -475,8 +547,14 @@ async function decryptFromPrivateStorage(record) {
 
 async function persistState() {
   const state = { users: [...users.values()], logs: [...logs.values()], alerts: [...alerts.values()] }
-  if (process.env.MONGODB_URI) {
-    await AppState.findByIdAndUpdate('securelog', state, { upsert: true, setDefaultsOnInsert: true })
+  const pool = await getPgPool()
+  if (pool) {
+    await pool.query(
+      `INSERT INTO securelog_state (id, users, logs, alerts, updated_at)
+       VALUES ('securelog', $1::jsonb, $2::jsonb, $3::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET users = EXCLUDED.users, logs = EXCLUDED.logs, alerts = EXCLUDED.alerts, updated_at = NOW()`,
+      [JSON.stringify(state.users), JSON.stringify(state.logs), JSON.stringify(state.alerts)],
+    )
     return
   }
   await fs.mkdir(dataRoot, { recursive: true })
@@ -487,11 +565,17 @@ async function persistState() {
 
 async function loadState() {
   let state
-  if (process.env.MONGODB_URI) {
-    if (mongoose.connection.readyState === 0) {
-      await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 5000 })
+  const pool = await getPgPool()
+  if (pool) {
+    const result = await pool.query('SELECT users, logs, alerts FROM securelog_state WHERE id = $1', ['securelog'])
+    state = result.rows[0] || null
+    if (!state) {
+      try {
+        state = JSON.parse(await fs.readFile(bundledStateFile, 'utf8'))
+      } catch (bundledError) {
+        if (bundledError.code !== 'ENOENT') throw bundledError
+      }
     }
-    state = await AppState.findById('securelog').lean()
   } else {
     try {
       state = JSON.parse(await fs.readFile(stateFile, 'utf8'))
@@ -507,13 +591,16 @@ async function loadState() {
     }
   }
   if (!state) return
+  users.clear()
+  logs.clear()
+  alerts.clear()
   for (const user of state.users || []) users.set(user.id, user)
   for (const log of state.logs || []) logs.set(log.logId, log)
   for (const alert of state.alerts || []) alerts.set(alert.logId, alert)
 }
 
-async function syncStateIfMongo() {
-  if (process.env.MONGODB_URI) {
+async function syncStateIfDatabase() {
+  if (databaseUrl()) {
     await loadState()
   }
 }
@@ -529,10 +616,10 @@ const allowedOrigins = [
 app.use(helmet())
 app.use(cors({ origin: allowedOrigins, credentials: true }))
 app.use(express.json({ limit: '12mb' }))
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'securelog-api', mode: 'prototype', metadataStore: process.env.MONGODB_URI ? 'mongodb' : 'local-file' }))
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'securelog-api', mode: 'prototype', metadataStore: databaseUrl() ? 'supabase-postgres' : 'local-file' }))
 
 app.post('/api/auth/register', async (req, res) => {
-  await syncStateIfMongo()
+  await syncStateIfDatabase()
   const { name, email, phone, password, role = 'user', adminInviteCode } = req.body
   const normalizedEmail = String(email || '').toLowerCase().trim()
   if (!name?.trim() || !normalizedEmail || !password || password.length < 12) {
@@ -563,12 +650,12 @@ app.post('/api/auth/register', async (req, res) => {
 })
 
 app.post('/api/auth/login', async (req, res) => {
-  await syncStateIfMongo()
+  await syncStateIfDatabase()
   const email = String(req.body.email || '').toLowerCase().trim()
   const user = [...users.values()].find(candidate => candidate.email === email)
   if (!user) {
-    if (isVercel && !process.env.MONGODB_URI) {
-      return res.status(401).json({ error: 'Account not found on this serverless instance because MONGODB_URI is not configured in Vercel. Add MONGODB_URI for persistent login, or register again.' })
+    if (isVercel && !databaseUrl()) {
+      return res.status(401).json({ error: 'Account not found on this serverless instance because Supabase Postgres (POSTGRES_URL / SUPABASE_DB_URL) is not configured in Vercel. Add it for persistent login, or register again.' })
     }
     return res.status(401).json({ error: 'Email or password is incorrect.' })
   }
@@ -580,7 +667,7 @@ app.post('/api/auth/login', async (req, res) => {
 })
 
 app.post('/api/auth/resend-code', async (req, res) => {
-  await syncStateIfMongo()
+  await syncStateIfDatabase()
   const challenge = verifySignedPayload(req.body.challengeId)
   if (!challenge || usedChallenges.has(challenge.id)) {
     return res.status(404).json({ error: 'Verification session expired or not found. Please start again.' })
@@ -599,7 +686,7 @@ app.post('/api/auth/resend-code', async (req, res) => {
 })
 
 app.post('/api/auth/verify-code', async (req, res) => {
-  await syncStateIfMongo()
+  await syncStateIfDatabase()
   const challenge = verifySignedPayload(req.body.challengeId)
   const submittedCodeHash = challenge?.id ? hashChallengeCode(challenge.id, req.body.code) : ''
   const codeMatches = Boolean(
@@ -635,6 +722,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: publicUser(r
 
 app.post('/api/logs/upload', requireAuth, upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Upload a .log, .txt, .json, or .csv file.' })
+  await syncStateIfDatabase()
   const logId = `SL-${crypto.randomUUID()}`
   const sha256 = crypto.createHash('sha256').update(req.file.buffer).digest('hex')
   const stored = await encryptToPrivateStorage(req.user.id, logId, req.file.buffer)
@@ -643,8 +731,12 @@ app.post('/api/logs/upload', requireAuth, upload.single('file'), async (req, res
   await persistState()
   res.status(201).json({ ...sanitizeLogForUser(record), storage: `Private encrypted storage; ${record.storageSavingsPercent}% smaller than original` })
 })
-app.get('/api/logs', requireAuth, (req, res) => res.json({ logs: [...logs.values()].filter(log => log.organizationId === req.user.organizationId).map(sanitizeLogForUser) }))
-app.get('/api/admin/hashes', requireAuth, requireSuperAdmin, (_req, res) => {
+app.get('/api/logs', requireAuth, async (req, res) => {
+  await syncStateIfDatabase()
+  res.json({ logs: [...logs.values()].filter(log => log.organizationId === req.user.organizationId).map(sanitizeLogForUser) })
+})
+app.get('/api/admin/hashes', requireAuth, requireSuperAdmin, async (_req, res) => {
+  await syncStateIfDatabase()
   const hashes = [...logs.values()]
     .sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))
     .map(record => {
@@ -663,11 +755,16 @@ app.get('/api/admin/hashes', requireAuth, requireSuperAdmin, (_req, res) => {
   res.json({ hashes })
 })
 app.delete('/api/logs/:logId', requireAuth, async (req, res) => {
+  await syncStateIfDatabase()
   const record = logs.get(req.params.logId)
   if (!record || record.userId !== req.user.id) return res.status(404).json({ error: 'Log not found.' })
   const previousStatus = record.status
   markInternalWrite(record.userId, record.logId)
   await fs.rm(path.join(storageRoot, record.userId, `${record.logId}.bin`), { force: true })
+  const pool = await getPgPool()
+  if (pool) {
+    await pool.query('DELETE FROM securelog_blobs WHERE log_id = $1', [record.logId])
+  }
   logs.delete(record.logId)
   const now = new Date().toISOString()
   const owner = users.get(record.userId)
@@ -700,6 +797,7 @@ app.delete('/api/logs/:logId', requireAuth, async (req, res) => {
   res.json({ deleted: true, logId: record.logId, emailNotification })
 })
 app.get('/api/logs/:logId/content', requireAuth, async (req, res) => {
+  await syncStateIfDatabase()
   const record = logs.get(req.params.logId)
   if (!record || record.organizationId !== req.user.organizationId) return res.status(404).json({ error: 'Log not found.' })
   try {
@@ -719,6 +817,7 @@ app.get('/api/logs/:logId/content', requireAuth, async (req, res) => {
   }
 })
 app.put('/api/logs/:logId/content', requireAuth, async (req, res) => {
+  await syncStateIfDatabase()
   const record = logs.get(req.params.logId)
   if (!record || record.organizationId !== req.user.organizationId) return res.status(404).json({ error: 'Log not found.' })
   if (typeof req.body?.content !== 'string') return res.status(400).json({ error: 'File content text is required.' })
@@ -746,6 +845,7 @@ app.put('/api/logs/:logId/content', requireAuth, async (req, res) => {
   })
 })
 app.post('/api/logs/:logId/verify', requireAuth, verifyUpload.single('file'), async (req, res) => {
+  await syncStateIfDatabase()
   const record = logs.get(req.params.logId)
   if (!record || record.organizationId !== req.user.organizationId) return res.status(404).json({ error: 'Log not found.' })
   try {
@@ -764,13 +864,15 @@ app.post('/api/logs/:logId/verify', requireAuth, verifyUpload.single('file'), as
     })
   } catch { res.status(500).json({ error: 'The encrypted record could not be verified.' }) }
 })
-app.get('/api/alerts', requireAuth, (req, res) => {
+app.get('/api/alerts', requireAuth, async (req, res) => {
+  await syncStateIfDatabase()
   const visibleAlerts = [...alerts.values()]
     .filter(alert => (req.user?.role || 'user') === 'super_admin' || (alert.organizationId || logs.get(alert.logId)?.organizationId) === req.user.organizationId)
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
   res.json({ alerts: visibleAlerts })
 })
-app.get('/api/dashboard/stats', requireAuth, (req, res) => {
+app.get('/api/dashboard/stats', requireAuth, async (req, res) => {
+  await syncStateIfDatabase()
   const ownLogs = [...logs.values()].filter(log => log.organizationId === req.user.organizationId)
   res.json({ totalLogs: ownLogs.length, verified: ownLogs.filter(log => log.status === 'VERIFIED').length, tampered: ownLogs.filter(log => log.status === 'TAMPERED').length, activeAlerts: [...alerts.values()].filter(alert => (alert.organizationId || logs.get(alert.logId)?.organizationId) === req.user.organizationId && alert.status === 'OPEN').length, blockchainTransactions: 0, organizations: 1, apiRequests: 0 })
 })
