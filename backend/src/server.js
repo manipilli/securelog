@@ -896,8 +896,9 @@ app.post('/api/v1/logs/ingest', (_req, res) => res.status(501).json({ error: 'AP
 app.use((error, _req, res, _next) => { if (error.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File exceeds the 10 MB limit.' }); res.status(400).json({ error: 'The request could not be processed.' }) })
 app.use((_req, res) => res.status(404).json({ error: 'Route not found' }))
 async function ensureSuperAdminAccount() {
-  const email = (process.env.SUPER_ADMIN_EMAIL || 'superadmin@gmail.com').toLowerCase().trim()
-  const password = process.env.SUPER_ADMIN_PASSWORD || 'superadmin@gmail.com'
+  const email = (process.env.SUPER_ADMIN_EMAIL || '').toLowerCase().trim()
+  const password = process.env.SUPER_ADMIN_PASSWORD || ''
+  if (!email || !password) return
   const existing = [...users.values()].find(candidate => candidate.email === email)
   if (existing) {
     if (existing.role !== 'super_admin') {
