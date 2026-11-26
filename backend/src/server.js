@@ -464,13 +464,24 @@ function databaseUrl() {
   )
 }
 
+function sanitizedPgConnectionString(connectionString) {
+  try {
+    const parsed = new URL(connectionString)
+    parsed.searchParams.delete('sslmode')
+    parsed.searchParams.delete('sslrootcert')
+    return parsed.toString()
+  } catch {
+    return connectionString
+  }
+}
+
 async function getPgPool() {
-  const connectionString = databaseUrl()
-  if (!connectionString) return null
+  const rawConnectionString = databaseUrl()
+  if (!rawConnectionString) return null
   if (!pgPool) {
-    const isLocalHost = /@(127\.0\.0\.1|localhost)(:|\/)/i.test(connectionString)
+    const isLocalHost = /@(127\.0\.0\.1|localhost)(:|\/)/i.test(rawConnectionString)
     pgPool = new Pool({
-      connectionString,
+      connectionString: isLocalHost ? rawConnectionString : sanitizedPgConnectionString(rawConnectionString),
       max: 3,
       ssl: isLocalHost ? false : { rejectUnauthorized: false },
     })
@@ -565,11 +576,13 @@ async function persistState() {
 
 async function loadState() {
   let state
+  let shouldSeedPg = false
   const pool = await getPgPool()
   if (pool) {
     const result = await pool.query('SELECT users, logs, alerts FROM securelog_state WHERE id = $1', ['securelog'])
     state = result.rows[0] || null
     if (!state) {
+      shouldSeedPg = true
       try {
         state = JSON.parse(await fs.readFile(bundledStateFile, 'utf8'))
       } catch (bundledError) {
@@ -597,6 +610,9 @@ async function loadState() {
   for (const user of state.users || []) users.set(user.id, user)
   for (const log of state.logs || []) logs.set(log.logId, log)
   for (const alert of state.alerts || []) alerts.set(alert.logId, alert)
+  if (shouldSeedPg) {
+    await persistState()
+  }
 }
 
 async function syncStateIfDatabase() {
